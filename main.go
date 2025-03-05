@@ -1,0 +1,882 @@
+package main
+
+import (
+	"bytes"
+	"encoding/base64"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"github.com/Quiq/webauthn_proxy/user"
+	"github.com/Quiq/webauthn_proxy/util"
+	"github.com/go-webauthn/webauthn/protocol"
+	"io/ioutil"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/go-webauthn/webauthn/webauthn"
+	"github.com/gorilla/sessions"
+	"github.com/sirupsen/logrus"
+	"github.com/spf13/viper"
+	yaml "gopkg.in/yaml.v3"
+)
+
+type Configuration struct {
+	RPDisplayName string   // Relying party display name
+	RPID          string   // Relying party ID
+	RPOrigins     []string // Relying party origin
+
+	// Note: enabling this can be risky as it allows anyone to add themselves to the proxy.
+	// Only enable test mode during testing!
+	TestMode bool
+
+	ServerAddress             string
+	ServerPort                string
+	SessionSoftTimeoutSeconds int
+	SessionHardTimeoutSeconds int
+	UsernameRegex             string
+}
+
+type CredentialsConfiguration struct {
+	CookieSecrets []string          `yaml:"cookie_session_secrets"`
+	Credentials   map[string]string `yaml:"user_credentials"`
+}
+
+type WebAuthnMessage struct {
+	Message string
+}
+
+type RegistrationSuccess struct {
+	Message string
+	Data    string
+}
+
+type LoginVerification struct {
+	IPAddr    string
+	LoginTime time.Time
+}
+
+const (
+	SessionCookieName           = "webauthn-proxy-session"
+	UserCookieName              = "webauthn-proxy-username"
+	AuthenticatedUsernameHeader = "X-Authenticated-User"
+	loginVerificationInterval   = 5 * time.Minute
+	staticPath                  = "static/"
+)
+
+var (
+	configuration      Configuration
+	loginError         WebAuthnMessage
+	registrationError  WebAuthnMessage
+	authError          WebAuthnMessage
+	users              map[string]user.User
+	registrations      map[string]user.User
+	cookieSecrets      []string
+	dynamicOrigins     bool
+	webAuthns          map[string]*webauthn.WebAuthn
+	sessionStores      map[string]*sessions.CookieStore
+	loginVerifications map[string]*LoginVerification
+	logger             *logrus.Entry
+)
+
+func main() {
+	var (
+		genSecretFlag, versionFlag bool
+		loggingLevel               string
+	)
+	flag.StringVar(&loggingLevel, "log-level", "info", "logging level")
+	flag.BoolVar(&genSecretFlag, "generate-secret", false, "generate a random string suitable as a cookie secret")
+	flag.BoolVar(&versionFlag, "version", false, "show version")
+	flag.Parse()
+	logger = util.SetupLogging("webauthn_proxy", loggingLevel)
+
+	if genSecretFlag {
+		fmt.Println(util.GenChallenge())
+		return
+	} else if versionFlag {
+		fmt.Println(version)
+		return
+	}
+
+	var err error
+	var credfile []byte
+	var credentialsConfig CredentialsConfiguration
+	// Standard error messages
+	loginError = WebAuthnMessage{Message: "Unable to login"}
+	registrationError = WebAuthnMessage{Message: "Error during registration"}
+	authError = WebAuthnMessage{Message: "Unauthenticated"}
+
+	users = make(map[string]user.User)
+	registrations = make(map[string]user.User)
+	webAuthns = make(map[string]*webauthn.WebAuthn)
+	sessionStores = make(map[string]*sessions.CookieStore)
+	loginVerifications = make(map[string]*LoginVerification)
+
+	// Set configuration defaults
+	viper.SetDefault("configpath", "./config")
+	viper.SetEnvPrefix("webauthn_proxy")
+	viper.BindEnv("configpath")
+	viper.SetConfigName("config")
+	viper.SetConfigType("yml")
+
+	viper.SetDefault("rpdisplayname", "MyCompany")
+	viper.SetDefault("rpid", "localhost")
+	viper.SetDefault("rporigins", []string{})
+	viper.SetDefault("testmode", false)
+	viper.SetDefault("serveraddress", "0.0.0.0")
+	viper.SetDefault("serverport", "18080")
+	viper.SetDefault("sessionsofttimeoutseconds", 28800)
+	viper.SetDefault("sessionhardtimeoutseconds", 86400)
+	viper.SetDefault("usernameregex", "^.+$")
+
+	// Read in configuration file
+	configpath := viper.GetString("configpath")
+	viper.AddConfigPath(configpath)
+	logger.Infof("Reading config file %s/config.yml", configpath)
+	if err := viper.ReadInConfig(); err != nil {
+		logger.Fatalf("Error reading config file %s/config.yml: %s", configpath, err)
+	}
+	if err = viper.Unmarshal(&configuration); err != nil {
+		logger.Fatalf("Unable to decode config file into struct: %s", err)
+	}
+	// Read in credentials file
+	credentialspath := filepath.Join(configpath, "credentials.yml")
+	logger.Infof("Reading credentials file %s", credentialspath)
+
+	if credfile, err = os.ReadFile(credentialspath); err != nil {
+		logger.Fatalf("Unable to read credential file %s %v", credentialspath, err)
+	}
+	if err = yaml.Unmarshal(credfile, &credentialsConfig); err != nil {
+		logger.Fatalf("Unable to parse YAML credential file %s %v", credentialspath, err)
+	}
+
+	logger.Debugf("Configuration: %+v\n", configuration)
+	logger.Debugf("Viper AllSettings: %+v\n", viper.AllSettings())
+
+	// Ensure that session soft timeout <= hard timeout
+	if configuration.SessionSoftTimeoutSeconds < 1 {
+		logger.Fatalf("Invalid session soft timeout of %d, must be > 0", configuration.SessionSoftTimeoutSeconds)
+	} else if configuration.SessionHardTimeoutSeconds < 1 {
+		logger.Fatalf("Invalid session hard timeout of %d, must be > 0", configuration.SessionHardTimeoutSeconds)
+	} else if configuration.SessionHardTimeoutSeconds < configuration.SessionSoftTimeoutSeconds {
+		logger.Fatal("Invalid session hard timeout, must be > session soft timeout")
+	}
+
+	cookieSecrets = credentialsConfig.CookieSecrets
+	if len(cookieSecrets) == 0 {
+		logger.Warnf("You did not set any cookie_session_secrets in credentials.yml.")
+		logger.Warnf("So it will be dynamic and your cookie sessions will not persist proxy restart.")
+		logger.Warnf("Generate one using `-generate-secret` flag and add to credentials.yml.")
+	}
+	if len(cookieSecrets) > 0 && cookieSecrets[0] == "your-own-cookie-secret" {
+		logger.Warnf("You did not set any valid cookie_session_secrets in credentials.yml.")
+		logger.Fatalf("Generate one using `-generate-secret` flag and add to credentials.yml.")
+	}
+	for username, credential := range credentialsConfig.Credentials {
+		unmarshaledUser, err := user.UnmarshalUser(credential)
+		if err != nil {
+			logger.Fatalf("Error unmarshalling user credential %s: %s", username, err)
+		}
+		if username != unmarshaledUser.Name {
+			logger.Fatalf("Credentials for user %s are designated for another one %s", username, unmarshaledUser.Name)
+		}
+		users[username] = *unmarshaledUser
+		//if logrus.GetLevel() == logrus.DebugLevel {
+		util.PrettyPrint(unmarshaledUser)
+		//}
+	}
+
+	// Print the effective config.
+	fmt.Println()
+	fmt.Printf("Relying Party Display Name: %s\n", configuration.RPDisplayName)
+	fmt.Printf("Relying Party ID: %s\n", configuration.RPID)
+	fmt.Printf("Relying Party Origins: %v\n", configuration.RPOrigins)
+	fmt.Printf("Test Mode: %v\n", configuration.TestMode)
+	fmt.Printf("Server Address: %s\n", configuration.ServerAddress)
+	fmt.Printf("Server Port: %s\n", configuration.ServerPort)
+	fmt.Printf("Session Soft Timeout: %d\n", configuration.SessionSoftTimeoutSeconds)
+	fmt.Printf("Session Hard Timeout: %d\n", configuration.SessionHardTimeoutSeconds)
+	fmt.Printf("Username Regex: %s\n", configuration.UsernameRegex)
+	fmt.Printf("Cookie secrets: %d\n", len(cookieSecrets))
+	fmt.Printf("User credentials: %d\n", len(users))
+	fmt.Println()
+	if configuration.TestMode {
+		fmt.Printf("Warning!!! Test Mode enabled! This is not safe for production!\n\n")
+	}
+
+	// If list of relying party origins has been specified in configuration,
+	// create one Webauthn config / Session store per origin, else origins will be dynamic.
+	if len(configuration.RPOrigins) > 0 {
+		for _, origin := range configuration.RPOrigins {
+			if _, _, err := createWebAuthnClient(origin); err != nil {
+				logger.Fatalf("Failed to create WebAuthn from config: %s", err)
+			}
+		}
+	} else {
+		dynamicOrigins = true
+	}
+
+	r := http.NewServeMux()
+	fileServer := http.FileServer(http.Dir("./static"))
+	r.Handle("/webauthn/static/", http.StripPrefix("/webauthn/static/", fileServer))
+	r.HandleFunc("/", HandleIndex)
+	r.HandleFunc("/webauthn/login", HandleLogin)
+	r.HandleFunc("/webauthn/login/get_credential_request_options", GetCredentialRequestOptions)
+	r.HandleFunc("/webauthn/login/process_login_assertion", ProcessLoginAssertion)
+	r.HandleFunc("/webauthn/register", HandleRegister)
+	r.HandleFunc("/webauthn/register/get_credential_creation_options", GetCredentialCreationOptions)
+	r.HandleFunc("/webauthn/register/process_registration_attestation", ProcessRegistrationAttestation)
+	r.HandleFunc("/webauthn/auth", HandleAuth)
+	r.HandleFunc("/webauthn/verify", HandleVerify)
+	r.HandleFunc("/webauthn/logout", HandleLogout)
+	r.HandleFunc("/webauthn/custom_login", HandleCustomLogin)
+
+	listenAddress := fmt.Sprintf("%s:%s", configuration.ServerAddress, configuration.ServerPort)
+	logger.Infof("Starting server at %s", listenAddress)
+	logger.Fatal(http.ListenAndServe(listenAddress, r))
+}
+
+// Root page
+func HandleIndex(w http.ResponseWriter, r *http.Request) {
+	http.Redirect(w, r, "/webauthn/login", http.StatusTemporaryRedirect)
+}
+
+// /webauthn/auth - Check if user has an authenticated session
+// This endpoint can be used for internal nginx checks.
+// Also this endpoint prolongs the user session by soft limit interval.
+func HandleAuth(w http.ResponseWriter, r *http.Request) {
+	_, sessionStore, err := checkOrigin(r)
+	if err != nil {
+		logger.Errorf("Error validating origin: %s", err)
+		util.JSONResponse(w, authError, http.StatusBadRequest)
+		return
+	}
+
+	session, err := sessionStore.Get(r, SessionCookieName)
+	if err != nil {
+		logger.Errorf("Error getting session from session store during user auth handler: %s", err)
+		util.JSONResponse(w, authError, http.StatusInternalServerError)
+		return
+	}
+
+	if auth, ok := session.Values["authenticated"].(bool); !ok || !auth {
+		util.JSONResponse(w, authError, http.StatusUnauthorized)
+		return
+	}
+	username := session.Values["authenticated_user"].(string)
+	if time.Now().Unix()-session.Values["authenticated_time"].(int64) >= int64(configuration.SessionHardTimeoutSeconds) {
+		// Session has exceeded the hard limit
+		logger.Debugf("Expiring user %s session expired by hard limit", username)
+		util.ExpireWebauthnSession(session, r, w)
+		util.JSONResponse(w, authError, http.StatusUnauthorized)
+		return
+	}
+	userIP := session.Values["authenticated_ip"].(string)
+	if userIP != util.GetUserIP(r) {
+		// User IP mismatches, let use to re-login
+		logger.Debugf("Invalidating user %s session coming from %s while session was created from %s", username, util.GetUserIP(r), userIP)
+		util.ExpireWebauthnSession(session, r, w)
+		util.JSONResponse(w, authError, http.StatusUnauthorized)
+		return
+	}
+
+	// Update the session to reset the soft timeout
+	session.Save(r, w)
+	w.Header().Set(AuthenticatedUsernameHeader, username)
+	util.JSONResponse(w, WebAuthnMessage{Message: "OK"}, http.StatusOK)
+}
+
+// /webauthn/login - Show authenticated page or serve up login page
+func HandleLogin(w http.ResponseWriter, r *http.Request) {
+	_, sessionStore, err := checkOrigin(r)
+	if err != nil {
+		logger.Errorf("Error validating origin: %s", err)
+		util.JSONResponse(w, loginError, http.StatusBadRequest)
+		return
+	}
+
+	session, err := sessionStore.Get(r, SessionCookieName)
+	if err != nil {
+		logger.Errorf("Error getting session from session store during login handler: %s", err)
+		util.JSONResponse(w, loginError, http.StatusInternalServerError)
+		return
+	}
+
+	// Prevents html caching because this page serves two different pages.
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, post-check=0, pre-check=0")
+	if auth, ok := session.Values["authenticated"].(bool); !ok || !auth {
+		http.ServeFile(w, r, filepath.Join(staticPath, "login.html"))
+		return
+	}
+
+	if redirectUrl := r.URL.Query().Get("redirect_url"); redirectUrl != "" {
+		http.Redirect(w, r, redirectUrl, http.StatusTemporaryRedirect)
+	} else {
+		http.ServeFile(w, r, filepath.Join(staticPath, "authenticated.html"))
+	}
+}
+
+// /webauthn/logout - Logout page
+func HandleLogout(w http.ResponseWriter, r *http.Request) {
+	_, sessionStore, err := checkOrigin(r)
+	if err != nil {
+		logger.Errorf("Error validating origin: %s", err)
+		util.JSONResponse(w, authError, http.StatusBadRequest)
+		return
+	}
+
+	session, err := sessionStore.Get(r, SessionCookieName)
+	if err == nil {
+		util.ExpireWebauthnSession(session, r, w)
+	}
+	http.Redirect(w, r, "/webauthn/login", http.StatusTemporaryRedirect)
+}
+
+// /webauthn/verify - one-time verification if user has recently authenticated, useful as 2FA check.
+func HandleVerify(w http.ResponseWriter, r *http.Request) {
+	_, _, err := checkOrigin(r)
+	if err != nil {
+		logger.Errorf("Error validating origin: %s", err)
+		util.JSONResponse(w, authError, http.StatusBadRequest)
+		return
+	}
+
+	username := r.URL.Query().Get("username")
+	userIP := r.URL.Query().Get("ip")
+	if data, exists := loginVerifications[username]; exists {
+		// Check whether this is whithin last 5 min.
+		if data.LoginTime.Add(loginVerificationInterval).Before(time.Now()) {
+			delete(loginVerifications, username)
+			util.JSONResponse(w, authError, http.StatusUnauthorized)
+			return
+		}
+		if data.IPAddr == userIP {
+			// Check once and delete
+			delete(loginVerifications, username)
+			logger.Infof("User %s verified successfully from %s", username, userIP)
+			util.JSONResponse(w, WebAuthnMessage{Message: "OK"}, http.StatusOK)
+			return
+		} else {
+			logger.Warnf("User %s failed verification: auth IP %s, validating IP %s", username, data.IPAddr, userIP)
+		}
+	}
+	util.JSONResponse(w, authError, http.StatusUnauthorized)
+}
+
+// /webauthn/register - Serve up registration page
+func HandleRegister(w http.ResponseWriter, r *http.Request) {
+	http.ServeFile(w, r, filepath.Join(staticPath, "register.html"))
+}
+
+// /webauthn/custom_login - Serve up custom login page
+func HandleCustomLogin(w http.ResponseWriter, r *http.Request) {
+	_, sessionStore, err := checkOrigin(r)
+	if err != nil {
+		logger.Errorf("Error validating origin: %s", err)
+		util.JSONResponse(w, loginError, http.StatusBadRequest)
+		return
+	}
+
+	session, err := sessionStore.Get(r, SessionCookieName)
+	if err != nil {
+		logger.Errorf("Error getting session from session store during custom login handler: %s", err)
+		util.JSONResponse(w, loginError, http.StatusInternalServerError)
+		return
+	}
+
+	// Prevents html caching because this page serves two different pages.
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, post-check=0, pre-check=0")
+	if auth, ok := session.Values["authenticated"].(bool); !ok || !auth {
+		http.ServeFile(w, r, filepath.Join(staticPath, "custom_login.html"))
+		return
+	}
+
+	if redirectUrl := r.URL.Query().Get("redirect_url"); redirectUrl != "" {
+		http.Redirect(w, r, redirectUrl, http.StatusTemporaryRedirect)
+	} else {
+		http.ServeFile(w, r, filepath.Join(staticPath, "authenticated.html"))
+	}
+}
+
+/*
+/webauthn/login/get_credential_request_options -
+Step 1 of the login process, get credential request options for the user
+*/
+func GetCredentialRequestOptions(w http.ResponseWriter, r *http.Request) {
+	webAuthn, sessionStore, err := checkOrigin(r)
+	if err != nil {
+		logger.Errorf("Error validating origin: %s", err)
+		util.JSONResponse(w, loginError, http.StatusBadRequest)
+		return
+	}
+
+	username, err := util.GetUsername(r, configuration.UsernameRegex)
+	if err != nil {
+		logger.Errorf("Error getting username: %s", err)
+		util.JSONResponse(w, loginError, http.StatusBadRequest)
+		return
+	}
+
+	user, exists := users[username]
+	if !exists {
+		logger.Warnf("User %s does not exist", username)
+		util.JSONResponse(w, loginError, http.StatusBadRequest)
+		return
+	}
+
+	// call beginLogin via wrapper
+	webAuthnWrapper := util.WebAuthnWrapper{
+		WebAuthn: webAuthn,
+	}
+	// Check if a custom challenge is provided in the query parameters
+	customChallenge := r.URL.Query().Get("challenge")
+
+	// Begin the login process
+	//options, sessionData, err := webAuthn.BeginLogin(user)
+	//if err != nil {
+	//	logger.Errorf("Error beginning the login process: %s", err)
+	//	util.JSONResponse(w, loginError, http.StatusInternalServerError)
+	//	return
+	//}
+
+	// Begin the login process
+	options, sessionData, err := webAuthnWrapper.BeginLogin(user, []byte(customChallenge))
+	if err != nil {
+		logger.Errorf("Error beginning the login process: %s", err)
+		util.JSONResponse(w, loginError, http.StatusInternalServerError)
+		return
+	}
+
+	if customChallenge != "" {
+		sessionData.Challenge = base64.RawURLEncoding.EncodeToString([]byte(customChallenge))
+	}
+
+	// Store Webauthn session data
+	session, err := sessionStore.Get(r, SessionCookieName)
+	if err != nil {
+		logger.Errorf("Error getting session from session store during login: %s", err)
+		util.JSONResponse(w, loginError, http.StatusInternalServerError)
+		return
+	}
+
+	err = util.SaveWebauthnSession(session, "authentication", sessionData, r, w)
+	if err != nil {
+		logger.Errorf("Error saving Webauthn session during login: %s", err)
+		util.JSONResponse(w, loginError, http.StatusInternalServerError)
+		return
+	}
+
+	util.JSONResponse(w, options, http.StatusOK)
+}
+
+/*
+/webauthn/login/process_login_assertion -
+Step 2 of the login process, process the assertion from the client authenticator
+*/
+func ProcessLoginAssertion(w http.ResponseWriter, r *http.Request) {
+	webAuthn, sessionStore, err := checkOrigin(r)
+	if err != nil {
+		logger.Errorf("Error validating origin: %s", err)
+		util.JSONResponse(w, loginError, http.StatusBadRequest)
+		return
+	}
+
+	username, err := util.GetUsername(r, configuration.UsernameRegex)
+	if err != nil {
+		logger.Errorf("Error getting username: %s", err)
+		util.JSONResponse(w, loginError, http.StatusBadRequest)
+		return
+	}
+
+	user, exists := users[username]
+	if !exists {
+		logger.Errorf("User %s does not exist", username)
+		util.JSONResponse(w, loginError, http.StatusBadRequest)
+		return
+	}
+
+	// Load the session data
+	session, err := sessionStore.Get(r, SessionCookieName)
+	if err != nil {
+		logger.Errorf("Error getting session from session store during login: %s", err)
+		util.JSONResponse(w, loginError, http.StatusInternalServerError)
+		return
+	}
+
+	sessionData, err := util.FetchWebauthnSession(session, "authentication", r)
+	if err != nil {
+		logger.Errorf("Error getting Webauthn session during login: %s", err)
+		util.JSONResponse(w, loginError, http.StatusInternalServerError)
+		return
+	}
+	// Set the custom challenge if present
+	customChallenge := r.URL.Query().Get("challenge")
+	if customChallenge != "" {
+		sessionData.Challenge = base64.RawURLEncoding.EncodeToString([]byte(customChallenge))
+	}
+	// Read the body of the original request
+	bodyBytes, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		logger.Errorf("Error reading request body: %s", err)
+		util.JSONResponse(w, loginError, http.StatusInternalServerError)
+		return
+	}
+
+	// Restore the original request body
+	r.Body = ioutil.NopCloser(bytes.NewBuffer(bodyBytes))
+
+	// Create a copy of the request with the same body
+	rCopy := r.Clone(r.Context())
+	rCopy.Body = ioutil.NopCloser(bytes.NewBuffer(bodyBytes))
+
+	parsedResponse, err := protocol.ParseCredentialRequestResponse(rCopy)
+	if err != nil {
+		logger.Errorf("Error parsing credential request response: %s", err)
+		util.JSONResponse(w, loginError, http.StatusBadRequest)
+		return
+	}
+	// print the raw response
+	raw, _ := json.Marshal(parsedResponse.Raw)
+	logger.Printf("Raw response: %s", string(raw))
+
+	cred, err := webAuthn.FinishLogin(user, sessionData, r)
+	if err != nil {
+		logger.Errorf("Error finishing Webauthn login: %s", err)
+		util.JSONResponse(w, loginError, http.StatusInternalServerError)
+		return
+	}
+
+	// Check for cloned authenticators
+	if cred.Authenticator.CloneWarning {
+		logger.Errorf("Error. Authenticator for %s appears to be cloned, failing login", username)
+		util.JSONResponse(w, loginError, http.StatusBadRequest)
+		return
+	}
+
+	// Increment sign counter on user to help avoid clones
+	if userCredential, err := user.CredentialById(cred.ID); err != nil {
+		logger.Errorf("Error incrementing sign counter on user authenticator: %s", err)
+		util.JSONResponse(w, loginError, http.StatusBadRequest)
+		return
+	} else {
+		userCredential.Authenticator.UpdateCounter(cred.Authenticator.SignCount)
+	}
+
+	// Set user as authenticated
+	userIP := util.GetUserIP(r)
+	loginVerifications[username] = &LoginVerification{IPAddr: userIP, LoginTime: time.Now()}
+	// session cookie
+	session.Values["authenticated"] = true
+	session.Values["authenticated_user"] = username
+	session.Values["authenticated_time"] = time.Now().Unix()
+	session.Values["authenticated_ip"] = userIP
+	session.Save(r, w)
+	// username cookie
+	ck := http.Cookie{
+		Name:    UserCookieName,
+		Path:    "/",
+		Value:   username,
+		Expires: time.Now().AddDate(1, 0, 0), // 1 year
+	}
+	http.SetCookie(w, &ck)
+	logger.Infof("User %s authenticated successfully from %s", username, userIP)
+	util.JSONResponse(w, WebAuthnMessage{Message: "Authentication Successful"}, http.StatusOK)
+}
+
+/*
+/webauthn/register/get_credential_creation_options -
+Step 1 of the registration process, get credential creation options
+*/
+func GetCredentialCreationOptions(w http.ResponseWriter, r *http.Request) {
+	webAuthn, sessionStore, err := checkOrigin(r)
+	if err != nil {
+		logger.Errorf("Error validating origin: %s", err)
+		util.JSONResponse(w, registrationError, http.StatusBadRequest)
+		return
+	}
+
+	username, err := util.GetUsername(r, configuration.UsernameRegex)
+	if err != nil {
+		logger.Errorf("Error getting username: %s", err)
+		util.JSONResponse(w, registrationError, http.StatusBadRequest)
+		return
+	}
+
+	// We allow a user to register multiple time with different authenticators.
+	// First check if they are an existing user
+	user, exists := users[username]
+	if !exists {
+		// Not found, see if they have registered previously
+		if user, exists = registrations[username]; !exists {
+			// Create a new user
+			user = *user.NewUser(username)
+			registrations[username] = user
+		}
+	}
+
+	// Generate PublicKeyCredentialCreationOptions, session data}
+	options, sessionData, err := webAuthn.BeginRegistration(user, user.UserRegistrationOptions)
+
+	if err != nil {
+		logger.Errorf("Error beginning Webauthn registration: %s", err)
+		util.JSONResponse(w, registrationError, http.StatusInternalServerError)
+		return
+	}
+
+	// Store session data as marshaled JSON
+	session, err := sessionStore.Get(r, SessionCookieName)
+	if err != nil {
+		logger.Errorf("Error getting session from session store during registration: %s", err)
+		util.JSONResponse(w, registrationError, http.StatusInternalServerError)
+		return
+	}
+
+	if err = util.SaveWebauthnSession(session, "registration", sessionData, r, w); err != nil {
+		logger.Errorf("Error saving Webauthn session during registration: %s", err)
+		util.JSONResponse(w, registrationError, http.StatusInternalServerError)
+		return
+	}
+
+	util.JSONResponse(w, options, http.StatusOK)
+}
+
+/*
+/webauthn/register/process_registration_attestation -
+Step 2 of the registration process, process the attestation (new credential) from the client authenticator
+*/
+func ProcessRegistrationAttestation(w http.ResponseWriter, r *http.Request) {
+	webAuthn, sessionStore, err := checkOrigin(r)
+	if err != nil {
+		logger.Errorf("Error validating origin: %s", err)
+		util.JSONResponse(w, registrationError, http.StatusBadRequest)
+		return
+	}
+
+	username, err := util.GetUsername(r, configuration.UsernameRegex)
+	if err != nil {
+		logger.Errorf("Error getting username: %s", err)
+		util.JSONResponse(w, registrationError, http.StatusBadRequest)
+		return
+	}
+
+	// First check if they are an existing user
+	user, exists := users[username]
+	if !exists {
+		// Not found, check the registrants pool
+		if user, exists = registrations[username]; !exists {
+			// Somethings wrong here. We made it here without the registrant going
+			// through GetCredentialCreationOptions. Fail this request.
+			logger.Errorf("Registrant %s skipped GetCredentialCreationOptions step, failing registration", username)
+			util.JSONResponse(w, registrationError, http.StatusBadRequest)
+			return
+		}
+	}
+
+	// Load the session data
+	session, err := sessionStore.Get(r, SessionCookieName)
+	if err != nil {
+		logger.Errorf("Error getting session from session store during registration: %s", err)
+		util.JSONResponse(w, registrationError, http.StatusInternalServerError)
+		return
+	}
+
+	sessionData, err := util.FetchWebauthnSession(session, "registration", r)
+	if err != nil {
+		logger.Errorf("Error getting Webauthn session during registration: %s", err)
+		util.JSONResponse(w, registrationError, http.StatusInternalServerError)
+		return
+	}
+
+	// make a copy of r and pass it to each of the methods
+	// as the ParseCredentialCreationResponse method will read the body
+	// and we need to read it again in the FinishRegistration method
+	// to get the body for the user.
+	attestation, err := protocol.ParseCredentialCreationResponse(r)
+
+	// Marshal the attestation object to JSON
+	attestationJSON, err := json.Marshal(attestation)
+	if err != nil {
+		logger.Errorf("Error marshaling attestation object to JSON: %s", err)
+		return
+	}
+
+	// Print the JSON representation of the attestation object
+	fmt.Printf("Attestation JSON: %s\n", attestationJSON)
+	//Convert the attestation object to JSON
+	//attestationJSON, err := json.Marshal(attestation.Response.AttestationObject)
+	//if err != nil {
+	//	logger.Errorf("Error marshaling attestation object to JSON: %s", err)
+	//	return
+	//}
+
+	// Encode the JSON string
+	encodedAttestation := base64.RawURLEncoding.EncodeToString(attestation.Raw.AttestationResponse.AttestationObject)
+
+	// Handle CollectedClientData
+	clientDataJSON, err := json.Marshal(attestation.Response.CollectedClientData)
+	if err != nil {
+		logger.Errorf("Error marshaling clientDataJSON object to JSON: %s", err)
+		return
+	}
+	attestationData := Attestation{
+		ID:                      base64.RawURLEncoding.EncodeToString(attestation.RawID),
+		RawID:                   base64.RawURLEncoding.EncodeToString(attestation.RawID),
+		AuthenticatorAttachment: string(attestation.AuthenticatorAttachment),
+		Response: AttestationResponse{
+			AttestationObject: encodedAttestation,
+			ClientDataJSON:    base64.RawURLEncoding.EncodeToString(clientDataJSON),
+		},
+		Type: "public-key",
+	}
+
+	attestationFinalJSON, err := json.Marshal(attestationData)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Error marshaling attestation object to JSON: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Print the JSON encoded attestation object
+	fmt.Printf("Attestation Object-----: %s\n", base64.RawURLEncoding.EncodeToString(attestationFinalJSON))
+	//fmt.Printf("Attestation Object JSON: %s\n", attestationFinalJSON)
+
+	credential, err := webAuthn.CreateCredential(user, sessionData, attestation)
+	if err != nil {
+		logger.Errorf("Error finishing Webauthn registration: %s", err)
+		util.JSONResponse(w, registrationError, http.StatusInternalServerError)
+		return
+	}
+
+	// Check that the credential doesn't belong to another user or registrant
+	for _, u := range users {
+		for _, c := range u.Credentials {
+			if bytes.Equal(c.ID, credential.ID) {
+				logger.Errorf("Error registering credential for user %s, matching credential ID with user %s", username, u.Name)
+				util.JSONResponse(w, registrationError, http.StatusBadRequest)
+				return
+			}
+		}
+	}
+	for _, r := range registrations {
+		for _, c := range r.Credentials {
+			if bytes.Equal(c.ID, credential.ID) {
+				logger.Errorf("Error registering credential for user %s, matching credential ID with registrant %s", username, r.Name)
+				util.JSONResponse(w, registrationError, http.StatusBadRequest)
+				return
+			}
+		}
+	}
+
+	// Add the credential to the user
+	user.AddCredential(*credential)
+
+	// Note: enabling this can be risky as it allows anyone to add themselves to the proxy.
+	// Only enable test mode during testing!
+	if configuration.TestMode {
+		users[username] = user
+		delete(registrations, username)
+	}
+
+	// Marshal the user so it can be added to the credentials file
+	marshaledUser, err := user.Marshal()
+	if err != nil {
+		logger.Errorf("Error marshalling user object: %s", err)
+		util.JSONResponse(w, registrationError, http.StatusInternalServerError)
+		return
+	}
+
+	userCredText := fmt.Sprintf("%s: %s", username, marshaledUser)
+	successMessage := RegistrationSuccess{
+		Message: "Registration Successful. You can use the below attestation object in your reverse proxy!",
+		Data:    base64.RawURLEncoding.EncodeToString(attestationFinalJSON),
+	}
+	logger.Infof("New user registration for this site only: %s", userCredText)
+	util.JSONResponse(w, successMessage, http.StatusOK)
+}
+
+// Check that the origin is in our configuration or we're allowing dynamic origins
+func checkOrigin(r *http.Request) (*webauthn.WebAuthn, *sessions.CookieStore, error) {
+	u, err := url.Parse(r.URL.RequestURI())
+	if err != nil {
+		return nil, nil, fmt.Errorf("RPOrigin not valid URL: %+v", err)
+	}
+
+	// Try to determine the scheme, falling back to https
+	var scheme string
+	if u.Scheme != "" {
+		scheme = u.Scheme
+	} else if r.Header.Get("X-Forwarded-Proto") != "" {
+		scheme = r.Header.Get("X-Forwarded-Proto")
+	} else if r.Host != "" && !strings.Contains(r.Host, "localhost") { // localhost is always http
+		scheme = "https"
+	} else {
+		//only set http if localhost
+		scheme = "http"
+	}
+	origin := fmt.Sprintf("%s://%s", scheme, r.Host)
+
+	if webAuthn, exists := webAuthns[origin]; exists {
+		sessionStore := sessionStores[origin]
+		return webAuthn, sessionStore, nil
+	}
+
+	if !dynamicOrigins {
+		return nil, nil, fmt.Errorf("request origin not valid: %s", origin)
+	} else {
+		logger.Infof("Adding new dynamic origin: %s", origin)
+		webAuthn, sessionStore, err := createWebAuthnClient(origin)
+		return webAuthn, sessionStore, err
+	}
+}
+
+// createWebAuthnClient add webauthn client and session store per origin
+func createWebAuthnClient(origin string) (*webauthn.WebAuthn, *sessions.CookieStore, error) {
+	webAuthn, err := webauthn.New(&webauthn.Config{
+		RPDisplayName: configuration.RPDisplayName, // Relying party display name
+		RPID:          configuration.RPID,          // Relying party ID
+		RPOrigin:      origin,                      // Relying party origin
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create WebAuthn for origin: %s", origin)
+	}
+	webAuthns[origin] = webAuthn
+
+	var stringKeys []string
+	var byteKeyPairs [][]byte
+	if len(cookieSecrets) == 0 {
+		stringKeys = []string{util.GenChallenge()}
+	} else {
+		stringKeys = cookieSecrets
+	}
+	// Each keypair consists of auth key and enc key.
+	// If auth or enc key is changed all users will have to re-login.
+	// enc key is optional and should be up to 32 bytes!
+	// Otherwise it will whether fail with unclear error on login/register
+	// or if you are lucky complain about the length. Not using enc key (nil).
+	for _, s := range stringKeys {
+		byteKeyPairs = append(byteKeyPairs, []byte(s), nil)
+	}
+	var sessionStore = sessions.NewCookieStore(byteKeyPairs...)
+	sessionStore.Options = &sessions.Options{
+		Path:     "/",
+		MaxAge:   configuration.SessionSoftTimeoutSeconds,
+		HttpOnly: true,
+	}
+	sessionStores[origin] = sessionStore
+	return webAuthn, sessionStore, nil
+}
+
+type Attestation struct {
+	ID                      string              `json:"id"`
+	RawID                   string              `json:"rawId"`
+	Response                AttestationResponse `json:"response"`
+	Type                    string              `json:"type"`
+	AuthenticatorAttachment string              `json:"authenticatorAttachment,omitempty"`
+}
+
+type AttestationResponse struct {
+	AttestationObject string `json:"attestationObject"`
+	ClientDataJSON    string `json:"clientDataJSON"`
+}

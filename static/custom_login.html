@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Custom Login</title>
+    <script src="/webauthn/static/jquery-3.6.3.min.js"></script>
+    <script src="/webauthn/static/script.js"></script>
+    <script>
+        const authenticateUser_custom = () => {
+            const username = $('#username').val();
+            const challenge = $('#challenge').val();
+            if (!username || !challenge) {
+                $('#errorMessages').text('Username and challenge are required.');
+                return;
+            }
+
+            $.get(
+                '/webauthn/login/get_credential_request_options?username=' + encodeURIComponent(username)+ '&challenge=' + encodeURIComponent(challenge),
+                null,
+                data => data,
+                'json')
+                .then(credRequestOptions => {
+                    credRequestOptions.publicKey.challenge = bufferDecode(credRequestOptions.publicKey.challenge);
+                    credRequestOptions.publicKey.allowCredentials.forEach(listItem => {
+                        listItem.id = bufferDecode(listItem.id)
+                    });
+
+                    return navigator.credentials.get({
+                        publicKey: credRequestOptions.publicKey
+                    });
+                })
+                .then(assertion => {
+                    console.log('Assertion:', assertion); // Log the assertion object to inspect its structure
+                    return $.post(
+                        '/webauthn/login/process_login_assertion?username=' + encodeURIComponent(username)+ '&challenge=' + encodeURIComponent(challenge),
+                        formatFinishLoginParams(assertion),
+                        data => data,
+                        'json'
+                    );
+                }).then(success => {
+                successMessage(success.Message);
+                window.location.reload();
+            })
+                .catch(error => {
+                    if(error.hasOwnProperty("responseJSON")){
+                        errorMessage(error.responseJSON.Message);
+                    } else {
+                        errorMessage(error);
+                    }
+                });
+        };
+
+        $(document).ready(() => {
+            if (browserCheck()) {
+                $('#username').keyup(function(e) {
+                    if ($("#username").is(":focus") && event.key == "Enter") {
+                        authenticateUser_custom();
+                    }
+                });
+                $('#loginButton').click(authenticateUser_custom);
+
+                // Prepopulate the username field if specified
+                let queryString = window.location.search;
+                let urlParams = new URLSearchParams(queryString);
+                let username = null;
+                if (urlParams.has('default_username')) {
+                    username = urlParams.get('default_username');
+                } else {
+                    let cookies = document.cookie.split(';');
+                    for (let i = 0; i < cookies.length; i++) {
+                    let parts = cookies[i].split('=');
+                    if (parts[0].trim() === "webauthn-proxy-username") {
+                        username = decodeURIComponent(parts[1]);
+                        break;
+                    }
+                }
+            }
+
+            // Set focus and value to the username field
+            $('#username').focus();
+            $('#username').val(username);
+        }
+        });
+    </script>
+</head>
+<body>
+<h1>Custom Login Page</h1>
+<div id="errorMessages" class="errorMessageText"></div>
+<div id="successMessages" class="successMessageText"></div>
+<form id="login-form" action="/webauthn/custom_login/process_assertion" method="POST">
+    <label for="username">Username:</label>
+    <input type="text" id="username" name="username" required>
+    <br><br><br>
+    <label for="challenge">Challenge:</label>
+    <textarea type="text" id="challenge" name="challenge" rows="10" cols="50" required></textarea>
+    <br>
+    <button type="button" id="loginButton">Login</button>
+</form>
+</body>
+</html>
