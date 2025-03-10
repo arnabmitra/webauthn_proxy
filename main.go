@@ -739,7 +739,8 @@ func ProcessRegistrationAttestation(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Print the JSON encoded attestation object
-	fmt.Printf("Attestation Object-----: %s\n", base64.RawURLEncoding.EncodeToString(attestationFinalJSON))
+	b64Attestation := base64.RawURLEncoding.EncodeToString(attestationFinalJSON)
+	fmt.Printf("Attestation Object-----: %s\n", b64Attestation)
 	//fmt.Printf("Attestation Object JSON: %s\n", attestationFinalJSON)
 
 	credential, err := webAuthn.CreateCredential(user, sessionData, attestation)
@@ -789,8 +790,8 @@ func ProcessRegistrationAttestation(w http.ResponseWriter, r *http.Request) {
 
 	userCredText := fmt.Sprintf("%s: %s", username, marshaledUser)
 	successMessage := RegistrationSuccess{
-		Message: "Registration Successful. You can use the below attestation object in your reverse proxy!",
-		Data:    base64.RawURLEncoding.EncodeToString(attestationFinalJSON),
+		Message: "Registration Successful. You can use the below attestation object to the blockchain!",
+		Data:    b64Attestation,
 	}
 	logger.Infof("New user registration for this site only: %s", userCredText)
 	util.JSONResponse(w, successMessage, http.StatusOK)
