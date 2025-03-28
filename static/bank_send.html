@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebAuthn Bank Send</title>
+    <script src="/webauthn/static/jquery-3.6.3.min.js"></script>
+    <script src="/webauthn/static/script.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        const sendTransaction = () => {
+            const username = $('#username').val();
+            const fromAddress = $('#fromAddress').val();
+            const toAddress = $('#toAddress').val();
+            const amount = $('#amount').val();
+            const denom = $('#denom').val();
+
+            if (!username) {
+                $('#errorMessages').text('Username is required').show();
+                $('#successMessages').hide();
+                return;
+            }
+
+            if (!fromAddress || !toAddress || !amount || !denom) {
+                $('#errorMessages').text('All transaction fields are required').show();
+                $('#successMessages').hide();
+                return;
+            }
+
+            // First get a challenge from the server
+            $('#sendButton').prop('disabled', true).text('Processing...');
+
+            // First get a challenge from the server, including transaction details
+            // Step 1: Get challenge from server with transaction details
+            $.get(
+                '/webauthn/get_challenge',
+                {
+                    from: fromAddress,
+                    to: toAddress,
+                    amount: amount,
+                    denom: denom
+                },
+                data => data,
+                'json'
+            )
+                .then(challengeData => {
+                    $('#successMessages').text('Challenge received, requesting credentials...');
+
+                    // Step 2: Use the received challenge in the credential request
+                    const challenge = challengeData.challenge;
+
+                    // Get credential request options using the challenge and username
+                    return $.get(
+                        '/webauthn/login/get_credential_request_options?username=' +
+                        encodeURIComponent(username) + '&challenge=' + encodeURIComponent(challenge),
+                        null,
+                        data => data,
+                        'json'
+                    );
+                })
+                .then(credRequestOptions => {
+                    $('#successMessages').text('Waiting for authentication...');
+
+                    credRequestOptions.publicKey.challenge = bufferDecode(credRequestOptions.publicKey.challenge);
+                    credRequestOptions.publicKey.allowCredentials.forEach(listItem => {
+                        listItem.id = bufferDecode(listItem.id);
+                    });
+
+                    return navigator.credentials.get({
+                        publicKey: credRequestOptions.publicKey
+                    });
+                }).then(assertion => {
+                    // Now send the transaction with the signature
+                    return $.post(
+                        '/webauthn/banksend/process_transaction',
+                        {
+                            from: fromAddress,
+                            to: toAddress,
+                            amount: amount,
+                            denom: denom,
+                            assertion: JSON.stringify(formatFinishLoginParams(assertion))
+                        },
+                        data => data,
+                        'json'
+                    );
+                }).then(success => {
+                successMessage(success.message);
+                $('#txHash').text(success.txHash);
+                $('#preformattedMessages').val(success.rawData);
+                $('#base64Messages').val(success.base64Data);
+                $('#resultArea').show();
+                // Restore button state
+                $('#sendButton').prop('disabled', false).text('Send Transaction');
+            })
+                .catch(error => {
+                    if(error.hasOwnProperty("responseJSON")){
+                        errorMessage(error.responseJSON.message);
+                    } else {
+                        errorMessage("Error: " + error);
+                    }
+                });
+        };
+
+        $(document).ready(() => {
+            if (browserCheck()) {
+                $('#sendButton').click(sendTransaction);
+
+                $('#copyRawButton').click(() => {
+                    var preformattedMessagesArea = $('#preformattedMessages');
+                    preformattedMessagesArea.select();
+                    navigator.clipboard.writeText(preformattedMessagesArea.val());
+                    preformattedMessagesArea.fadeOut(200).fadeIn(200);
+                });
+
+                $('#copyBase64Button').click(() => {
+                    var base64MessagesArea = $('#base64Messages');
+                    base64MessagesArea.select();
+                    navigator.clipboard.writeText(base64MessagesArea.val());
+                    base64MessagesArea.fadeOut(200).fadeIn(200);
+                });
+            }
+        });
+    </script>
+</head>
+<body class="bg-gray-100 min-h-screen py-8">
+<div class="max-w-3xl mx-auto px-4">
+    <h1 class="text-3xl font-bold text-center text-blue-700 mb-8">WebAuthn Bank Send</h1>
+
+    <div id="errorMessages" class="text-red-600 font-medium text-center mb-4"></div>
+    <div id="successMessages" class="text-green-600 font-medium text-center mb-4"></div>
+
+    <div class="bg-white rounded-lg shadow-md p-6 mb-8">
+        <form id="bank-send-form" class="space-y-6">
+            <div class="space-y-2">
+                <label for="username" class="block text-sm font-medium text-gray-700">Username:</label>
+                <input type="text" id="username" name="username" required
+                       class="w-full px-4 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                       placeholder="Enter your username">
+            </div>
+            <div class="space-y-2">
+                <label for="fromAddress" class="block text-sm font-medium text-gray-700">From Address:</label>
+                <input type="text" id="fromAddress" name="fromAddress" required
+                       class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+                       placeholder="tp...">
+            </div>
+
+            <div class="space-y-2">
+                <label for="toAddress" class="block text-sm font-medium text-gray-700">To Address:</label>
+                <input type="text" id="toAddress" name="toAddress" required
+                       class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+                       placeholder="tp...">
+            </div>
+
+            <div class="grid grid-cols-2 gap-4">
+                <div class="space-y-2">
+                    <label for="amount" class="block text-sm font-medium text-gray-700">Amount:</label>
+                    <input type="number" id="amount" name="amount" required
+                           class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500">
+                </div>
+
+                <div class="space-y-2">
+                    <label for="denom" class="block text-sm font-medium text-gray-700">Denomination:</label>
+                    <select id="denom" name="denom" required
+                            class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500">
+                        <option value="nhash">nhash</option>
+                        <option value="atom">atom</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="flex justify-center">
+                <button type="button" id="sendButton"
+                        class="px-4 py-2 bg-blue-600 text-white font-medium rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition-colors">
+                    Send Transaction
+                </button>
+            </div>
+        </form>
+    </div>
+
+    <div id="resultArea" class="bg-white rounded-lg shadow-md p-6 mb-8" style="display: none;">
+        <div class="mb-4">
+            <h3 class="text-lg font-medium text-gray-900 mb-2">Transaction Hash:</h3>
+            <p id="txHash" class="p-2 bg-gray-50 border border-gray-300 rounded-md font-mono text-sm"></p>
+        </div>
+
+        <div class="mb-6">
+            <div class="flex items-center justify-between mb-2">
+                <h3 class="text-lg font-medium text-gray-900">Raw Transaction Data:</h3>
+                <button id="copyRawButton" class="p-2 text-blue-600 hover:text-blue-800 focus:outline-none">
+                    <img src="/webauthn/static/clipboard.png" alt="Copy raw data" class="h-5 w-5">
+                </button>
+            </div>
+            <textarea readonly id="preformattedMessages" rows="8"
+                      class="w-full px-3 py-2 text-sm font-mono bg-gray-50 border border-gray-300 rounded-md"></textarea>
+        </div>
+
+        <div>
+            <div class="flex items-center justify-between mb-2">
+                <h3 class="text-lg font-medium text-gray-900">Base64 Encoded Signature:</h3>
+                <button id="copyBase64Button" class="p-2 text-blue-600 hover:text-blue-800 focus:outline-none">
+                    <img src="/webauthn/static/clipboard.png" alt="Copy base64 data" class="h-5 w-5">
+                </button>
+            </div>
+            <textarea readonly id="base64Messages" rows="3"
+                      class="w-full px-3 py-2 text-sm font-mono bg-gray-50 border border-gray-300 rounded-md"></textarea>
+        </div>
+    </div>
+</div>
+</body>
+</html>

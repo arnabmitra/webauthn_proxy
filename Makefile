@@ -7,7 +7,7 @@ NOCACHE=--no-cache
 dummy:
 	@echo "Nothing to do here."
 
-build:
+build-docker:
 	docker build ${NOCACHE} -t ${IMAGE}:${VERSION} .
 
 public:
@@ -15,3 +15,10 @@ public:
 
 test:
 	docker buildx build ${NOCACHE} --platform linux/arm64 -t docker.quiq.sh/webauthn_proxy:test --push .
+build:
+	go build
+
+proto-compile:
+	protoc -I ./proto --go_out=./pkg/pb --go_opt=paths=source_relative \
+		--go-grpc_out=./pkg/pb --go-grpc_opt=paths=source_relative \
+		proto/smartaccounts/v1/*.proto

@@ -10,6 +10,7 @@ import (
 	"github.com/Quiq/webauthn_proxy/util"
 	"github.com/go-webauthn/webauthn/protocol"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -233,6 +234,9 @@ func main() {
 	r.HandleFunc("/webauthn/verify", HandleVerify)
 	r.HandleFunc("/webauthn/logout", HandleLogout)
 	r.HandleFunc("/webauthn/custom_login", HandleCustomLogin)
+	r.HandleFunc("/webauthn/bank_send", HandleBankSend)
+	r.HandleFunc("/webauthn/banksend/process_transaction", ProcessBankSendTransaction)
+	r.HandleFunc("/webauthn/get_challenge", GetBankSendChallenge)
 
 	listenAddress := fmt.Sprintf("%s:%s", configuration.ServerAddress, configuration.ServerPort)
 	logger.Infof("Starting server at %s", listenAddress)
@@ -540,7 +544,10 @@ func ProcessLoginAssertion(w http.ResponseWriter, r *http.Request) {
 	}
 	// print the raw response
 	raw, _ := json.Marshal(parsedResponse.Raw)
-	logger.Printf("Raw response: %s", string(raw))
+	logger.Printf("Raw response which is the signature payload: %s", prettyPrintJSON(raw))
+	logger.Printf("base64 encoded signature payload : %s", base64.RawURLEncoding.EncodeToString(raw))
+	prettyRaw := prettyPrintJSON(raw)
+	base64Raw := base64.RawURLEncoding.EncodeToString(raw)
 
 	cred, err := webAuthn.FinishLogin(user, sessionData, r)
 	if err != nil {
@@ -583,7 +590,20 @@ func ProcessLoginAssertion(w http.ResponseWriter, r *http.Request) {
 	}
 	http.SetCookie(w, &ck)
 	logger.Infof("User %s authenticated successfully from %s", username, userIP)
-	util.JSONResponse(w, WebAuthnMessage{Message: "Authentication Successful"}, http.StatusOK)
+
+	// Modified response
+	response := LoginAssertionResponse{
+		Message:    "Authentication Successful",
+		RawData:    prettyRaw,
+		Base64Data: base64Raw,
+	}
+	util.JSONResponse(w, response, http.StatusOK)
+}
+
+type LoginAssertionResponse struct {
+	Message    string `json:"message"`
+	RawData    string `json:"rawData"`
+	Base64Data string `json:"base64Data"`
 }
 
 /*
@@ -880,4 +900,21 @@ type Attestation struct {
 type AttestationResponse struct {
 	AttestationObject string `json:"attestationObject"`
 	ClientDataJSON    string `json:"clientDataJSON"`
+}
+
+func prettyPrintJSON(data []byte) string {
+	var i interface{}
+	err := json.Unmarshal(data, &i)
+	if err != nil {
+		log.Fatalf("Error unmarshaling JSON: %v", err)
+		return ""
+	}
+
+	prettyJSON, err := json.MarshalIndent(i, "", "    ")
+	if err != nil {
+		log.Fatalf("Error marshaling JSON for pretty printing: %v", err)
+		return ""
+	}
+
+	return string(prettyJSON)
 }

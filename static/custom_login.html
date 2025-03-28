@@ -6,6 +6,8 @@
     <title>Custom Login</title>
     <script src="/webauthn/static/jquery-3.6.3.min.js"></script>
     <script src="/webauthn/static/script.js"></script>
+    <!-- Add Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
     <script>
         const authenticateUser_custom = () => {
             const username = $('#username').val();
@@ -31,7 +33,7 @@
                     });
                 })
                 .then(assertion => {
-                    console.log('Assertion:', assertion); // Log the assertion object to inspect its structure
+                    console.log('Assertion:', assertion);
                     return $.post(
                         '/webauthn/login/process_login_assertion?username=' + encodeURIComponent(username)+ '&challenge=' + encodeURIComponent(challenge),
                         formatFinishLoginParams(assertion),
@@ -40,7 +42,9 @@
                     );
                 }).then(success => {
                 successMessage(success.Message);
-                window.location.reload();
+                $('#preformattedMessages').val(success.rawData);
+                $('#base64Messages').val(success.base64Data);
+                $('#resultArea').show();
             })
                 .catch(error => {
                     if(error.hasOwnProperty("responseJSON")){
@@ -60,7 +64,6 @@
                 });
                 $('#loginButton').click(authenticateUser_custom);
 
-                // Prepopulate the username field if specified
                 let queryString = window.location.search;
                 let urlParams = new URLSearchParams(queryString);
                 let username = null;
@@ -69,33 +72,87 @@
                 } else {
                     let cookies = document.cookie.split(';');
                     for (let i = 0; i < cookies.length; i++) {
-                    let parts = cookies[i].split('=');
-                    if (parts[0].trim() === "webauthn-proxy-username") {
-                        username = decodeURIComponent(parts[1]);
-                        break;
+                        let parts = cookies[i].split('=');
+                        if (parts[0].trim() === "webauthn-proxy-username") {
+                            username = decodeURIComponent(parts[1]);
+                            break;
+                        }
                     }
                 }
-            }
 
-            // Set focus and value to the username field
-            $('#username').focus();
-            $('#username').val(username);
-        }
+                $('#username').focus();
+                $('#username').val(username);
+
+                $('#copyRawButton').click(() => {
+                    var preformattedMessagesArea = $('#preformattedMessages');
+                    preformattedMessagesArea.select();
+                    navigator.clipboard.writeText(preformattedMessagesArea.val());
+                    preformattedMessagesArea.fadeOut(200).fadeIn(200);
+                });
+
+                $('#copyBase64Button').click(() => {
+                    var base64MessagesArea = $('#base64Messages');
+                    base64MessagesArea.select();
+                    navigator.clipboard.writeText(base64MessagesArea.val());
+                    base64MessagesArea.fadeOut(200).fadeIn(200);
+                });
+            }
         });
     </script>
 </head>
-<body>
-<h1>Custom Login Page</h1>
-<div id="errorMessages" class="errorMessageText"></div>
-<div id="successMessages" class="successMessageText"></div>
-<form id="login-form" action="/webauthn/custom_login/process_assertion" method="POST">
-    <label for="username">Username:</label>
-    <input type="text" id="username" name="username" required>
-    <br><br><br>
-    <label for="challenge">Challenge:</label>
-    <textarea type="text" id="challenge" name="challenge" rows="10" cols="50" required></textarea>
-    <br>
-    <button type="button" id="loginButton">Login</button>
-</form>
+<body class="bg-gray-100 min-h-screen py-8">
+<div class="max-w-3xl mx-auto px-4">
+    <h1 class="text-3xl font-bold text-center text-blue-700 mb-8">Custom Login Page</h1>
+
+    <div id="errorMessages" class="text-red-600 font-medium text-center mb-4"></div>
+    <div id="successMessages" class="text-green-600 font-medium text-center mb-4"></div>
+
+    <div class="bg-white rounded-lg shadow-md p-6 mb-8">
+        <form id="login-form" action="/webauthn/custom_login/process_assertion" method="POST" class="space-y-6">
+            <div class="space-y-2">
+                <label for="username" class="block text-sm font-medium text-gray-700">Username:</label>
+                <input type="text" id="username" name="username" required
+                       class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500">
+            </div>
+
+            <div class="space-y-2">
+                <label for="challenge" class="block text-sm font-medium text-gray-700">Challenge:</label>
+                <textarea id="challenge" name="challenge" rows="6" required
+                          class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"></textarea>
+            </div>
+
+            <div class="flex justify-center">
+                <button type="button" id="loginButton"
+                        class="px-4 py-2 bg-blue-600 text-white font-medium rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition-colors">
+                    Login
+                </button>
+            </div>
+        </form>
+    </div>
+
+    <div id="resultArea" class="bg-white rounded-lg shadow-md p-6 mb-8" style="display: none;">
+        <div class="mb-6">
+            <div class="flex items-center justify-between mb-2">
+                <h3 class="text-lg font-medium text-gray-900">Raw Assertion Data:</h3>
+                <button id="copyRawButton" class="p-2 text-blue-600 hover:text-blue-800 focus:outline-none">
+                    <img src="/webauthn/static/clipboard.png" alt="Copy raw data" class="h-5 w-5">
+                </button>
+            </div>
+            <textarea readonly id="preformattedMessages" rows="8"
+                      class="w-full px-3 py-2 text-sm font-mono bg-gray-50 border border-gray-300 rounded-md"></textarea>
+        </div>
+
+        <div>
+            <div class="flex items-center justify-between mb-2">
+                <h3 class="text-lg font-medium text-gray-900">Base64 Encoded Assertion Data:</h3>
+                <button id="copyBase64Button" class="p-2 text-blue-600 hover:text-blue-800 focus:outline-none">
+                    <img src="/webauthn/static/clipboard.png" alt="Copy base64 data" class="h-5 w-5">
+                </button>
+            </div>
+            <textarea readonly id="base64Messages" rows="3"
+                      class="w-full px-3 py-2 text-sm font-mono bg-gray-50 border border-gray-300 rounded-md"></textarea>
+        </div>
+    </div>
+</div>
 </body>
 </html>
