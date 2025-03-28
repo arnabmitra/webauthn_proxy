@@ -158,8 +158,5 @@ Otherwise, if you wanted it to work for any service under _example.com_, you cou
 | testMode | When set to **_true_**, users can authenticate immediately after registering. Useful for testing, but generally not safe for production. | false |
 | usernameRegex | Regex for validating usernames | ^.+$ |
 
-
-## Thanks!
-- Duo Labs: https://duo.com/labs
-- Herbie Bolimovsky: https://www.herbie.dev/blog/webauthn-basic-web-client-server/
-- Paul Hankin / icza:  https://stackoverflow.com/questions/22892120/how-to-generate-a-random-string-of-a-fixed-length-in-go
+# To invoke a bank send to the provenance blockchain (or any cosmos based blockchain)
+http://localhost:18080/webauthn/bank_send
